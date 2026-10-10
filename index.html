@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IntervalIQ — Free Interval &amp; Tabata Timer with HIIT &amp; EMOM Presets</title>
+<meta name="description" content="IntervalIQ is a free online interval and Tabata timer with custom work, rest and rounds, Web Audio countdown beeps, HIIT, EMOM and Tabata presets, and a big-screen display mode for gyms and home workouts.">
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  body{font-family:'Barlow',system-ui,sans-serif;background:#0a0a0e;color:#f4f4f5}
+  .cond{font-family:'Barlow Condensed','Barlow',sans-serif}
+  .stage-work{background:radial-gradient(ellipse at 50% 0%,rgba(225,29,46,.28),transparent 60%),#101014}
+  .stage-rest{background:radial-gradient(ellipse at 50% 0%,rgba(34,197,94,.25),transparent 60%),#0c1210}
+  .stage-prep{background:radial-gradient(ellipse at 50% 0%,rgba(245,158,11,.25),transparent 60%),#12100a}
+  .stage-done{background:radial-gradient(ellipse at 50% 0%,rgba(59,130,246,.25),transparent 60%),#0a0e14}
+  .numin{background:#17171d;border:1px solid #2c2c35;border-radius:.6rem;padding:.55rem .7rem;width:100%;color:#fff;font-weight:600}
+  .numin:focus{outline:2px solid #e11d2e;border-color:transparent}
+  .chip{border:1px solid #2c2c35;background:#17171d;border-radius:999px;padding:.45rem 1rem;font-weight:600;font-size:.85rem;cursor:pointer;transition:.15s;color:#e4e4e7}
+  .chip:hover{border-color:#e11d2e;color:#fca5a5}
+  .chip.active{background:#e11d2e;border-color:#e11d2e;color:#fff}
+  .bigmode .hidemb{display:none!important}
+  .bigmode #timerDisplay{font-size:clamp(6rem,26vw,20rem)!important}
+  .bigmode #phaseLabel{font-size:clamp(2rem,7vw,4.5rem)!important}
+  details.faq summary{cursor:pointer;list-style:none}
+  details.faq summary::-webkit-details-marker{display:none}
+</style>
+<script id="lib-intervaliq">// IntervalIQ — pure interval-timer logic (no DOM, no timers).
+var IntervalIQLib = {
+  // Clamp a seconds value to [min, max]; fall back when not a finite number.
+  clampSeconds: function (v, min, max, fallback) {
+    if (typeof v === 'string' && v.trim() === '') return fallback;
+    var n = Number(v);
+    if (!isFinite(n)) return fallback;
+    n = Math.round(n);
+    if (n < min) return min;
+    if (n > max) return max;
+    return n;
+  },
+  clampRounds: function (v, fallback) {
+    var n = Number(v);
+    if (!isFinite(n)) return fallback;
+    n = Math.floor(n);
+    if (n < 1) return 1;
+    if (n > 99) return 99;
+    return n;
+  },
+  // Normalize a raw config into safe values.
+  normalizeConfig: function (cfg) {
+    cfg = cfg || {};
+    return {
+      work: IntervalIQLib.clampSeconds(cfg.work, 1, 3600, 30),
+      rest: IntervalIQLib.clampSeconds(cfg.rest, 0, 3600, 10),
+      rounds: IntervalIQLib.clampRounds(cfg.rounds, 8),
+      prep: IntervalIQLib.clampSeconds(cfg.prep, 0, 120, 10)
+    };
+  },
+  // Build the full phase schedule: prep (if >0), then work/rest per round.
+  // No rest is scheduled after the final round.
+  buildSchedule: function (cfg) {
+    var c = IntervalIQLib.normalizeConfig(cfg);
+    var phases = [];
+    if (c.prep > 0) phases.push({ type: 'prep', round: 0, duration: c.prep });
+    for (var r = 1; r <= c.rounds; r++) {
+      phases.push({ type: 'work', round: r, duration: c.work });
+      if (c.rest > 0 && r < c.rounds) phases.push({ type: 'rest', round: r, duration: c.rest });
+    }
+    return phases;
+  },
+  totalDuration: function (schedule) {
+    var t = 0;
+    for (var i = 0; i < schedule.length; i++) t += schedule[i].duration;
+    return t;
+  },
+  // Given elapsed seconds, return { index, phase, phaseElapsed, phaseRemaining, done }.
+  phaseAt: function (schedule, elapsed) {
+    var e = Math.max(0, Number(elapsed) || 0);
+    var acc = 0;
+    for (var i = 0; i < schedule.length; i++) {
+      var d = schedule[i].duration;
+      if (e < acc + d) {
+        return { index: i, phase: schedule[i], phaseElapsed: e - acc, phaseRemaining: acc + d - e, done: false };
+      }
+      acc += d;
+    }
+    return { index: schedule.length - 1, phase: schedule[schedule.length - 1] || null, phaseElapsed: 0, phaseRemaining: 0, done: true };
+  },
+  // "MM:SS" under an hour, "H:MM:SS" at/above an hour. Ceils partial seconds up.
+  formatTime: function (seconds) {
+    var s = Math.max(0, Math.ceil(Number(seconds) || 0));
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var sec = s % 60;
+    var mm = (m < 10 ? '0' : '') + m;
+    var ss = (sec < 10 ? '0' : '') + sec;
+    return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+  },
+  // Should a countdown beep sound? Beeps on the last 3 whole seconds of a phase.
+  isCountdownSecond: function (phaseRemaining) {
+    var r = Math.ceil(phaseRemaining);
+    return phaseRemaining > 0 && r <= 3;
+  },
+  PRESETS: {
+    tabata: { name: 'Tabata', work: 20, rest: 10, rounds: 8, prep: 10 },
+    emom: { name: 'EMOM 10', work: 45, rest: 15, rounds: 10, prep: 10 },
+    hiit: { name: 'HIIT Burner', work: 40, rest: 20, rounds: 12, prep: 10 },
+    boxing: { name: 'Boxing Rounds', work: 180, rest: 60, rounds: 12, prep: 15 },
+    beginner: { name: 'Gentle Start', work: 30, rest: 30, rounds: 6, prep: 10 }
+  },
+  getPreset: function (key) {
+    var p = IntervalIQLib.PRESETS[key];
+    if (!p) return null;
+    return { work: p.work, rest: p.rest, rounds: p.rounds, prep: p.prep };
+  }
+};
+if (typeof module !== 'undefined' && module.exports) { module.exports = IntervalIQLib; }
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"What is an interval timer and how does IntervalIQ work?","acceptedAnswer":{"@type":"Answer","text":"An interval timer alternates timed work periods with timed rest periods for a set number of rounds. In IntervalIQ you set your work time, rest time, rounds and an optional get-ready countdown, press Start, and the timer runs the whole session automatically with beeps marking every phase change."}},
+    {"@type":"Question","name":"What are the Tabata, EMOM and HIIT presets?","acceptedAnswer":{"@type":"Answer","text":"Tabata is 20 seconds of work and 10 seconds of rest for 8 rounds. EMOM (Every Minute On the Minute) here runs 45 seconds of work and 15 seconds of rest for 10 rounds so each round fills exactly one minute. The HIIT Burner preset uses 40 seconds of work and 20 seconds of rest for 12 rounds. Every preset can be edited after loading it."}},
+    {"@type":"Question","name":"Do the countdown beeps work on phones and tablets?","acceptedAnswer":{"@type":"Answer","text":"Yes. IntervalIQ generates its beeps with the Web Audio API directly in your browser, so no sound files are downloaded. Browsers require one tap before audio can play, so press Start (or the sound test) once and every beep for the session will work, including on phones and tablets."}},
+    {"@type":"Question","name":"What is big-screen display mode?","acceptedAnswer":{"@type":"Answer","text":"Big-screen mode expands the timer to fill your display using the fullscreen API and hides the settings, so the countdown can be read from across a gym floor or classroom. Press the Big Screen button to enter it and Esc or the button again to exit."}},
+    {"@type":"Question","name":"Can I use IntervalIQ without rest periods or a warm-up countdown?","acceptedAnswer":{"@type":"Answer","text":"Yes. Set rest to 0 and rounds run back to back with no breaks, which suits EMOM-style and circuit training. Set the get-ready countdown to 0 and the workout starts the instant you press Start."}},
+    {"@type":"Question","name":"Is IntervalIQ free and do I need an account?","acceptedAnswer":{"@type":"Answer","text":"IntervalIQ is completely free with unlimited usage. There is no signup, no account, no paywall and no watermark. Everything runs locally in your browser and no workout data ever leaves your device."}}
+  ]
+}
+</script>
+</head>
+<body id="top" class="min-h-screen">
+<header class="sticky top-0 z-40 bg-[#0a0a0e]/90 backdrop-blur border-b border-[#26262e]">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 h-16 flex items-center justify-between">
+    <a href="#top" class="flex items-center gap-2.5">
+      <span class="w-9 h-9 rounded-lg bg-[#e11d2e] flex items-center justify-center" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5L13 2z" fill="#fff"/></svg>
+      </span>
+      <span class="cond text-2xl tracking-wide font-bold">INTERVAL<span class="text-[#e11d2e]">IQ</span></span>
+    </a>
+    <nav class="flex items-center gap-5 text-sm font-semibold">
+      <a href="#top" class="text-zinc-300 hover:text-white">Home</a>
+      <a href="https://fixoraa.tech" class="text-zinc-300 hover:text-white">More Tools</a>
+    </nav>
+  </div>
+</header>
+
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pt-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <div class="origin-top scale-[0.44] sm:scale-100 shrink-0">
+        <script>
+          atOptions = { 'key' : '4e68ac77881c17fe128a46565d9a4e8c', 'format' : 'iframe', 'height' : 90, 'width' : 728, 'params' : {} };
+        </script>
+        <script src="https://www.highrevenueformat.com/4e68ac77881c17fe128a46565d9a4e8c/invoke.js"></script>
+      </div>
+    </div>
+  </div>
+</div>
+
+<main class="mx-auto max-w-6xl px-4 sm:px-6 py-6">
+  <div class="text-center mb-5">
+    <h1 class="cond text-4xl sm:text-5xl font-bold uppercase tracking-wide">Interval &amp; Tabata Timer</h1>
+    <p class="text-zinc-400 mt-2 max-w-xl mx-auto">Set your work, rest and rounds — IntervalIQ calls every phase with loud beeps so your eyes stay on the workout, not the clock.</p>
+    <span class="inline-block mt-3 bg-[#e11d2e]/15 text-red-300 border border-[#e11d2e]/40 rounded-full px-4 py-1 text-sm font-semibold">✓ Unlimited Free Usage — no signup, no watermark</span>
+  </div>
+
+  <section id="stage" class="stage-work rounded-3xl border border-[#2a2a33] overflow-hidden" aria-label="Timer stage">
+    <div class="px-4 sm:px-8 pt-6 pb-8 text-center">
+      <div class="flex items-center justify-center gap-3 flex-wrap">
+        <span id="phaseLabel" class="cond text-3xl sm:text-4xl font-bold uppercase tracking-[0.2em] text-red-400">Ready</span>
+        <span id="roundLabel" class="cond text-xl sm:text-2xl font-semibold text-zinc-400">Round – / –</span>
+      </div>
+      <div id="timerDisplay" class="cond font-bold leading-none my-2 tabular-nums" style="font-size:clamp(5rem,18vw,11rem)">00:00</div>
+      <div class="max-w-2xl mx-auto">
+        <div class="h-3 rounded-full bg-[#26262e] overflow-hidden" role="progressbar" aria-label="Session progress">
+          <div id="progressBar" class="h-full bg-[#e11d2e] transition-all duration-200" style="width:0%"></div>
+        </div>
+        <div class="flex justify-between text-xs text-zinc-400 mt-1.5 font-medium">
+          <span>Elapsed <span id="elapsedLabel" class="text-zinc-200">0:00</span></span>
+          <span>Next: <span id="nextLabel" class="text-zinc-200">—</span></span>
+          <span>Total <span id="totalLabel" class="text-zinc-200">0:00</span></span>
+        </div>
+      </div>
+      <p id="statusMsg" class="text-sm text-amber-300 mt-3 min-h-[1.25rem]" role="status"></p>
+      <div class="flex items-center justify-center gap-3 mt-3 flex-wrap">
+        <button id="startBtn" class="bg-[#e11d2e] hover:bg-[#c21424] text-white cond text-2xl font-bold uppercase tracking-widest rounded-xl px-10 py-3 transition shadow-lg shadow-red-900/40">Start</button>
+        <button id="resetBtn" class="bg-[#1d1d24] hover:bg-[#26262e] border border-[#34343e] text-zinc-200 cond text-2xl font-bold uppercase tracking-widest rounded-xl px-7 py-3 transition">Reset</button>
+        <button id="skipBtn" class="bg-[#1d1d24] hover:bg-[#26262e] border border-[#34343e] text-zinc-200 cond text-2xl font-bold uppercase tracking-widest rounded-xl px-7 py-3 transition">Skip ▸</button>
+      </div>
+      <div class="flex items-center justify-center gap-3 mt-4 flex-wrap hidemb">
+        <button id="bigBtn" class="chip">⛶ Big Screen</button>
+        <button id="soundBtn" class="chip active" aria-pressed="true">🔊 Sound On</button>
+        <button id="testBeepBtn" class="chip">Test Beep</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="mt-6 grid lg:grid-cols-5 gap-6 hidemb" id="settingsSection">
+    <div class="lg:col-span-3 bg-[#121218] border border-[#26262e] rounded-3xl p-5 sm:p-6">
+      <h2 class="cond text-2xl font-bold uppercase tracking-wide mb-4">Build Your Session</h2>
+      <div class="mb-5">
+        <p class="text-xs uppercase tracking-widest text-zinc-500 font-semibold mb-2">Presets</p>
+        <div class="flex flex-wrap gap-2" id="presetRow">
+          <button class="chip preset-chip" data-preset="tabata">Tabata 20/10 ×8</button>
+          <button class="chip preset-chip" data-preset="emom">EMOM 45/15 ×10</button>
+          <button class="chip preset-chip" data-preset="hiit">HIIT 40/20 ×12</button>
+          <button class="chip preset-chip" data-preset="boxing">Boxing 3:00/1:00 ×12</button>
+          <button class="chip preset-chip" data-preset="beginner">Gentle 30/30 ×6</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <label class="block"><span class="text-xs uppercase tracking-widest text-zinc-500 font-semibold">Work (sec)</span>
+          <input id="inWork" type="number" class="numin mt-1.5" min="1" max="3600" step="1" value="20"></label>
+        <label class="block"><span class="text-xs uppercase tracking-widest text-zinc-500 font-semibold">Rest (sec)</span>
+          <input id="inRest" type="number" class="numin mt-1.5" min="0" max="3600" step="1" value="10"></label>
+        <label class="block"><span class="text-xs uppercase tracking-widest text-zinc-500 font-semibold">Rounds</span>
+          <input id="inRounds" type="number" class="numin mt-1.5" min="1" max="99" step="1" value="8"></label>
+        <label class="block"><span class="text-xs uppercase tracking-widest text-zinc-500 font-semibold">Get Ready (sec)</span>
+          <input id="inPrep" type="number" class="numin mt-1.5" min="0" max="120" step="1" value="10"></label>
+      </div>
+      <div class="flex flex-wrap gap-2 mt-4 items-center">
+        <span class="text-sm text-zinc-400">Quick tweaks:</span>
+        <button class="chip qadd" data-field="work" data-delta="5">Work +5s</button>
+        <button class="chip qadd" data-field="work" data-delta="-5">Work −5s</button>
+        <button class="chip qadd" data-field="rounds" data-delta="1">Round +1</button>
+        <button class="chip qadd" data-field="rounds" data-delta="-1">Round −1</button>
+      </div>
+      <p id="configError" class="text-sm text-red-400 mt-2 min-h-[1.25rem]"></p>
+    </div>
+    <div class="lg:col-span-2 bg-[#121218] border border-[#26262e] rounded-3xl p-5 sm:p-6">
+      <h2 class="cond text-2xl font-bold uppercase tracking-wide mb-4">Session Breakdown</h2>
+      <dl class="space-y-2.5 text-sm">
+        <div class="flex justify-between border-b border-[#22222a] pb-2"><dt class="text-zinc-400">Total workout time</dt><dd id="sumTotal" class="font-bold text-lg">—</dd></div>
+        <div class="flex justify-between border-b border-[#22222a] pb-2"><dt class="text-zinc-400">Time working</dt><dd id="sumWork" class="font-semibold">—</dd></div>
+        <div class="flex justify-between border-b border-[#22222a] pb-2"><dt class="text-zinc-400">Time resting</dt><dd id="sumRest" class="font-semibold">—</dd></div>
+        <div class="flex justify-between"><dt class="text-zinc-400">Phases in session</dt><dd id="sumPhases" class="font-semibold">—</dd></div>
+      </dl>
+      <div id="phaseStrip" class="flex gap-1 mt-4 flex-wrap" aria-hidden="true"></div>
+      <p class="text-xs text-zinc-500 mt-3">Red blocks are work, green are rest, amber is the get-ready countdown. The strip updates live as you edit.</p>
+    </div>
+  </section>
+</main>
+
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pb-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <script async src="https://js.wpadmngr.com/static/adManager.js" data-admpid="464498"></script>
+    </div>
+  </div>
+</div>
+
+<article class="mx-auto max-w-4xl px-4 sm:px-6 py-10 text-zinc-300 leading-relaxed">
+  <h2 class="cond text-3xl sm:text-4xl font-bold uppercase text-white mb-4">The Interval Timer That Coaches Your Whole Workout</h2>
+  <p class="mb-4">An interval timer is the simplest piece of gym equipment you will ever own, and possibly the most important. Instead of counting repetitions or watching a wall clock, you train against time itself: a work period where you give full effort, a rest period where you recover just enough, and a set number of rounds that repeat until the session is done. IntervalIQ is a free online interval and Tabata timer built around that idea. You set four numbers — work seconds, rest seconds, rounds, and an optional get-ready countdown — and the timer runs the entire session hands-free, calling every phase change with clear audio beeps generated live in your browser. Whether you are midway through a kettlebell complex, holding a plank, or coaching a full class, you never need to look at the screen to know where you are.</p>
+  <p class="mb-4">Interval training earned its reputation because it works. Short, intense efforts separated by incomplete recovery push both your aerobic and anaerobic systems in a fraction of the time steady-state cardio demands. A classic four-minute Tabata protocol can deliver measurable fitness gains, and longer high-intensity interval training (HIIT) sessions of fifteen to thirty minutes fit into lunch breaks, hotel rooms, and living rooms. But the method only works if the timing is honest. Counting seconds in your head while exhausted is notoriously unreliable — everyone counts faster when they are tired. A dedicated interval timer removes the negotiation. The beep starts the work, the beep ends it, and your only job is to move.</p>
+
+  <h3 class="cond text-2xl font-bold uppercase text-white mt-8 mb-3">Custom Work, Rest and Rounds for Any Protocol</h3>
+  <p class="mb-4">Every training style has its own rhythm, so IntervalIQ does not lock you into one format. Work intervals can run from a single second to a full hour, rest can be anything from zero to an hour, and you can stack up to ninety-nine rounds. A sprinter might program thirty seconds of effort with ninety seconds of recovery for six rounds. A CrossFit athlete might set forty seconds on and twenty seconds off across a ten-station circuit. A yoga practitioner can use gentle two-minute holds with thirty-second transitions. A boxing coach can run three-minute rounds with one minute of rest, exactly like a real bout. The session breakdown panel updates as you type, showing total workout time, total time working, total time resting, and the number of phases, alongside a visual strip where each block is one phase — red for work, green for rest, amber for the get-ready countdown — so you can see the shape of your session before you start it.</p>
+  <p class="mb-4">Small details matter when you are setting up between exercises. Quick-tweak buttons nudge the work time up or down by five seconds and add or remove a round without typing. Invalid entries are handled gracefully: type a negative number or something impossible and IntervalIQ clamps it to a safe value and tells you what happened, rather than crashing or silently refusing to start. If you set rest to zero, rounds run back to back with no breaks at all, which is exactly what continuous circuits and EMOM-style training demand. If you set the get-ready countdown to zero, the workout begins the instant you press Start — useful when your hands are already on the bar.</p>
+
+  <h3 class="cond text-2xl font-bold uppercase text-white mt-8 mb-3">Tabata, EMOM and HIIT Presets, Ready in One Tap</h3>
+  <p class="mb-4">If you do not want to build a session from scratch, the preset row loads proven formats instantly. The Tabata preset follows the original protocol studied by Dr. Izumi Tabata: twenty seconds of maximal work, ten seconds of rest, eight rounds — four minutes that feel considerably longer. The EMOM preset runs forty-five seconds of work and fifteen seconds of rest for ten rounds, so every round fills exactly one minute; EMOM, short for Every Minute On the Minute, is a staple of functional fitness because the clock itself sets the pace and any leftover seconds become your rest. The HIIT Burner preset uses forty seconds on and twenty seconds off for twelve rounds, a forgiving ratio that sustains high output across a twenty-two-minute session. Boxing Rounds delivers twelve three-minute rounds with one-minute rests, and Gentle Start offers thirty-thirty intervals for six rounds for beginners, warm-ups, or active recovery days. Presets are starting points, not cages: load one, then edit any number to make it yours.</p>
+
+  <h3 class="cond text-2xl font-bold uppercase text-white mt-8 mb-3">Web Audio Countdown Beeps You Can Hear Across the Room</h3>
+  <p class="mb-4">Sound is the soul of an interval timer. IntervalIQ synthesizes its beeps with the Web Audio API, the same technology behind browser-based instruments and games, so tones are generated mathematically on your device — no audio files to download, no buffering, and crystal-clear timing. During the final three seconds of any phase you will hear short countdown beeps, the timer's way of saying get ready. A brighter two-tone signal marks the start of work, a lower signal marks rest, and a long finishing tone celebrates the end of the session. Because the beeps are synthesized, they stay perfectly in sync with the visual countdown even during long workouts. A sound toggle lets you mute the timer for quiet environments like offices or sleeping households, and a Test Beep button confirms your volume before the workout starts — no more discovering a muted phone thirty seconds into round one. One browser rule to know: audio can only begin after you interact with the page, which is why pressing Start unlocks the sound for the whole session.</p>
+
+  <h3 class="cond text-2xl font-bold uppercase text-white mt-8 mb-3">Big-Screen Display Mode for Gyms, Classes and Garage Training</h3>
+  <p class="mb-4">A phone propped against a water bottle is fine for solo training, but group sessions need a clock everyone can read. IntervalIQ's big-screen mode uses the fullscreen API to expand the stage across your entire display — a television, a projector, a tablet on a tripod, or a laptop at the end of the gym — while the digits grow to fill the space and the settings panels step aside. The stage also changes colour with the phase: a red glow for work, green for rest, amber during the get-ready countdown, and blue when you are done, so athletes can read the session state from peripheral vision without parsing numbers. Coaches use this mode to run stations without shouting times; home users cast it to a TV and train facing the screen instead of a phone on the floor. Press Esc or the Big Screen button again to return to the normal view.</p>
+
+  <h3 class="cond text-2xl font-bold uppercase text-white mt-8 mb-3">How to Run Your First Session</h3>
+  <p class="mb-4">Getting started takes under a minute. First, pick a preset that matches your goal, or enter your own work, rest, and round values. Second, check the session breakdown so the total time fits your schedule — a Tabata finisher is four minutes, while the HIIT preset runs twenty-two. Third, tap Test Beep and set a volume you can hear over music and breathing. Fourth, place your device where you can see it, or switch on big-screen mode, and press Start. During the workout the stage shows your current phase, the round you are on, a progress bar for the whole session, elapsed time, and what comes next. Pause any time life interrupts, skip forward if you need to jump a phase, or reset to start over. When the final work interval ends, the finishing tone plays and the stage turns blue: session complete.</p>
+  <p class="mb-4">A few programming tips will help you get more from any interval timer. Beginners should start with work-to-rest ratios of one-to-two or one-to-one and build toward one-to-half as fitness improves. Keep at least one truly easy interval day between hard sessions, because the adaptations happen during recovery, not during the beeps. If you are new to Tabata, remember the original protocol was performed at an intensity most people cannot sustain at first — using it at eighty percent effort for a few weeks is smart training, not failure. Finally, write your numbers down. The session you repeat and gradually extend beats the exotic workout you try once.</p>
+  <p class="mb-4">IntervalIQ runs entirely in your browser. There is no account to create, nothing to install, no subscription, and no watermark — just unlimited free usage on any device with a modern web browser. Your settings live only on your screen; close the tab and nothing about your workout has been sent anywhere. Bookmark it on your phone's home screen, open it on the gym television, or keep it in a browser tab next to your training log. Set the intervals, press Start, and let the beeps coach you through every round.</p>
+
+  <h2 class="cond text-3xl font-bold uppercase text-white mt-10 mb-5">Frequently Asked Questions</h2>
+  <div class="space-y-3">
+    <details class="faq bg-[#121218] border border-[#26262e] rounded-xl px-5 py-4">
+      <summary class="font-semibold text-white">What is an interval timer and how does IntervalIQ work?</summary>
+      <p class="mt-2 text-zinc-400">An interval timer alternates timed work periods with timed rest periods for a set number of rounds. In IntervalIQ you set your work time, rest time, rounds and an optional get-ready countdown, press Start, and the timer runs the whole session automatically with beeps marking every phase change.</p>
+    </details>
+    <details class="faq bg-[#121218] border border-[#26262e] rounded-xl px-5 py-4">
+      <summary class="font-semibold text-white">What are the Tabata, EMOM and HIIT presets?</summary>
+      <p class="mt-2 text-zinc-400">Tabata is 20 seconds of work and 10 seconds of rest for 8 rounds. EMOM (Every Minute On the Minute) here runs 45 seconds of work and 15 seconds of rest for 10 rounds so each round fills exactly one minute. The HIIT Burner preset uses 40 seconds of work and 20 seconds of rest for 12 rounds. Every preset can be edited after loading it.</p>
+    </details>
+    <details class="faq bg-[#121218] border border-[#26262e] rounded-xl px-5 py-4">
+      <summary class="font-semibold text-white">Do the countdown beeps work on phones and tablets?</summary>
+      <p class="mt-2 text-zinc-400">Yes. IntervalIQ generates its beeps with the Web Audio API directly in your browser, so no sound files are downloaded. Browsers require one tap before audio can play, so press Start (or the sound test) once and every beep for the session will work, including on phones and tablets.</p>
+    </details>
+    <details class="faq bg-[#121218] border border-[#26262e] rounded-xl px-5 py-4">
+      <summary class="font-semibold text-white">What is big-screen display mode?</summary>
+      <p class="mt-2 text-zinc-400">Big-screen mode expands the timer to fill your display using the fullscreen API and hides the settings, so the countdown can be read from across a gym floor or classroom. Press the Big Screen button to enter it and Esc or the button again to exit.</p>
+    </details>
+    <details class="faq bg-[#121218] border border-[#26262e] rounded-xl px-5 py-4">
+      <summary class="font-semibold text-white">Can I use IntervalIQ without rest periods or a warm-up countdown?</summary>
+      <p class="mt-2 text-zinc-400">Yes. Set rest to 0 and rounds run back to back with no breaks, which suits EMOM-style and circuit training. Set the get-ready countdown to 0 and the workout starts the instant you press Start.</p>
+    </details>
+    <details class="faq bg-[#121218] border border-[#26262e] rounded-xl px-5 py-4">
+      <summary class="font-semibold text-white">Is IntervalIQ free and do I need an account?</summary>
+      <p class="mt-2 text-zinc-400">IntervalIQ is completely free with unlimited usage. There is no signup, no account, no paywall and no watermark. Everything runs locally in your browser and no workout data ever leaves your device.</p>
+    </details>
+  </div>
+</article>
+
+<footer class="border-t border-[#26262e] py-6 text-center text-sm text-zinc-500">
+  <p>IntervalIQ — the interval timer that coaches every round. Train hard, rest honest.</p>
+<p class="fx-credit" style="text-align:center;font-size:12.5px;opacity:.62;margin:10px auto 2px;letter-spacing:.01em">Made by <a href="https://fixoraa.tech" target="_blank" rel="noopener" style="color:inherit;font-weight:700;text-decoration:underline;text-underline-offset:2px">Fixoraa</a></p>
+</footer>
+
+<script>
+(function(){
+  var L = IntervalIQLib;
+  var $ = function(id){ return document.getElementById(id); };
+  var stage=$('stage'), phaseLabel=$('phaseLabel'), roundLabel=$('roundLabel'), display=$('timerDisplay'),
+      progressBar=$('progressBar'), elapsedLabel=$('elapsedLabel'), totalLabel=$('totalLabel'), nextLabel=$('nextLabel'),
+      statusMsg=$('statusMsg'), startBtn=$('startBtn'), configError=$('configError');
+  var inputs={ work:$('inWork'), rest:$('inRest'), rounds:$('inRounds'), prep:$('inPrep') };
+
+  var schedule=[], total=0, running=false, paused=false, startStamp=0, elapsedBefore=0, rafId=null;
+  var lastPhaseIdx=-1, lastBeepSec=-1, soundOn=true, audioCtx=null;
+
+  function ensureAudio(){
+    if(!soundOn) return null;
+    try{
+      if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+      if(audioCtx.state==='suspended') audioCtx.resume();
+      return audioCtx;
+    }catch(e){ return null; }
+  }
+  function beep(freq, dur, delay, type){
+    var ctx=ensureAudio(); if(!ctx) return;
+    var t=ctx.currentTime+(delay||0);
+    var osc=ctx.createOscillator(), gain=ctx.createGain();
+    osc.type=type||'square'; osc.frequency.value=freq;
+    gain.gain.setValueAtTime(0.0001,t);
+    gain.gain.exponentialRampToValueAtTime(0.25,t+0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(t); osc.stop(t+dur+0.05);
+  }
+  function phaseSignal(type){
+    if(type==='work'){ beep(880,0.12,0); beep(1320,0.18,0.14); }
+    else if(type==='rest'){ beep(520,0.2,0,'sine'); }
+    else if(type==='prep'){ beep(660,0.12,0); }
+    else if(type==='done'){ beep(880,0.15,0); beep(880,0.15,0.2); beep(1174,0.5,0.4); }
+  }
+
+  function readConfig(){
+    return L.normalizeConfig({ work:inputs.work.value, rest:inputs.rest.value, rounds:inputs.rounds.value, prep:inputs.prep.value });
+  }
+  function refreshSummary(){
+    var cfg=readConfig();
+    schedule=L.buildSchedule(cfg); total=L.totalDuration(schedule);
+    var workT=0, restT=0;
+    schedule.forEach(function(p){ if(p.type==='work')workT+=p.duration; if(p.type==='rest')restT+=p.duration; });
+    $('sumTotal').textContent=L.formatTime(total);
+    $('sumWork').textContent=L.formatTime(workT);
+    $('sumRest').textContent=L.formatTime(restT);
+    $('sumPhases').textContent=schedule.length;
+    totalLabel.textContent=L.formatTime(total);
+    var strip=$('phaseStrip'); strip.innerHTML='';
+    schedule.forEach(function(p){
+      var d=document.createElement('span');
+      var pct=Math.max(2,(p.duration/total)*100);
+      d.style.width=pct+'%'; d.style.minWidth='8px'; d.style.height='14px'; d.style.borderRadius='3px';
+      d.style.background= p.type==='work' ? '#e11d2e' : (p.type==='rest' ? '#22c55e' : '#f59e0b');
+      d.title=(p.type==='prep'?'Get ready':p.type)+' '+L.formatTime(p.duration);
+      strip.appendChild(d);
+    });
+    if(!running && !paused){
+      var first=schedule[0];
+      display.textContent=L.formatTime(first?first.duration:0);
+      roundLabel.textContent='Round – / '+cfg.rounds;
+      phaseLabel.textContent='Ready';
+      nextLabel.textContent=first?labelFor(first):'—';
+    }
+    // Flag clamped/invalid values gently
+    var msgs=[];
+    if(String(cfg.work)!==String(Math.round(Number(inputs.work.value)||0)) && inputs.work.value!=='') msgs.push('Work time adjusted to '+cfg.work+'s (allowed 1–3600).');
+    if(Number(inputs.rounds.value)>99) msgs.push('Rounds capped at 99.');
+    if(Number(inputs.work.value)<1 && inputs.work.value!=='') msgs.push('Work time must be at least 1 second.');
+    configError.textContent=msgs.join(' ');
+  }
+  function labelFor(p){
+    if(!p) return 'Finish';
+    return (p.type==='work'?'Work':p.type==='rest'?'Rest':'Get Ready')+' '+L.formatTime(p.duration);
+  }
+  function stageClass(type){
+    stage.classList.remove('stage-work','stage-rest','stage-prep','stage-done');
+    stage.classList.add(type==='rest'?'stage-rest':type==='prep'?'stage-prep':type==='done'?'stage-done':'stage-work');
+  }
+  function render(elapsed){
+    var info=L.phaseAt(schedule, elapsed);
+    if(info.done){
+      finish(); return;
+    }
+    var p=info.phase;
+    display.textContent=L.formatTime(info.phaseRemaining);
+    phaseLabel.textContent= p.type==='work'?'WORK':p.type==='rest'?'REST':'GET READY';
+    phaseLabel.style.color= p.type==='work'?'#f87171':p.type==='rest'?'#4ade80':'#fbbf24';
+    var cfg=readConfig();
+    roundLabel.textContent= p.type==='prep' ? 'Get set…' : 'Round '+p.round+' / '+cfg.rounds;
+    elapsedLabel.textContent=L.formatTime(elapsed);
+    progressBar.style.width=(total? (elapsed/total)*100 : 0)+'%';
+    var next=schedule[info.index+1];
+    nextLabel.textContent=labelFor(next);
+    stageClass(p.type);
+    if(info.index!==lastPhaseIdx){
+      lastPhaseIdx=info.index; lastBeepSec=-1;
+      if(elapsed>0) phaseSignal(p.type);
+    }
+    if(L.isCountdownSecond(info.phaseRemaining)){
+      var sec=Math.ceil(info.phaseRemaining);
+      if(sec!==lastBeepSec){ lastBeepSec=sec; beep(1000,0.09,0); }
+    }
+  }
+  function tick(){
+    if(!running) return;
+    var elapsed=elapsedBefore+(performance.now()-startStamp)/1000;
+    render(elapsed);
+    if(running) rafId=requestAnimationFrame(tick);
+  }
+  function startPause(){
+    if(running){ // pause
+      running=false; paused=true;
+      elapsedBefore=elapsedBefore+(performance.now()-startStamp)/1000;
+      cancelAnimationFrame(rafId);
+      startBtn.textContent='Resume';
+      statusMsg.textContent='Paused — press Resume when you are ready.';
+      return;
+    }
+    ensureAudio();
+    if(!paused){ // fresh start
+      refreshSummary();
+      if(!schedule.length){ statusMsg.textContent='Add at least one round to start.'; return; }
+      elapsedBefore=0; lastPhaseIdx=-1; lastBeepSec=-1;
+      statusMsg.textContent='';
+      render(0);
+      if(schedule[0]) phaseSignal(schedule[0].type);
+    }
+    running=true; paused=false;
+    startStamp=performance.now();
+    startBtn.textContent='Pause';
+    statusMsg.textContent='';
+    rafId=requestAnimationFrame(tick);
+  }
+  function finish(){
+    running=false; paused=false;
+    cancelAnimationFrame(rafId);
+    display.textContent='00:00';
+    phaseLabel.textContent='DONE!';
+    phaseLabel.style.color='#60a5fa';
+    roundLabel.textContent='Session complete';
+    progressBar.style.width='100%';
+    elapsedLabel.textContent=L.formatTime(total);
+    nextLabel.textContent='Finish';
+    stageClass('done');
+    startBtn.textContent='Start Again';
+    statusMsg.textContent='Workout complete — great work!';
+    phaseSignal('done');
+  }
+  function reset(){
+    running=false; paused=false; elapsedBefore=0; lastPhaseIdx=-1; lastBeepSec=-1;
+    cancelAnimationFrame(rafId);
+    startBtn.textContent='Start';
+    statusMsg.textContent='';
+    stageClass('work'); phaseLabel.style.color='#f87171';
+    progressBar.style.width='0%'; elapsedLabel.textContent='0:00';
+    refreshSummary();
+  }
+
+  startBtn.addEventListener('click', startPause);
+  $('resetBtn').addEventListener('click', reset);
+  $('skipBtn').addEventListener('click', function(){
+    if(!schedule.length) refreshSummary();
+    if(!schedule.length) return;
+    var cur = paused||running ? elapsedBefore+(running?(performance.now()-startStamp)/1000:0) : 0;
+    var info=L.phaseAt(schedule, cur);
+    if(info.done){ reset(); return; }
+    var acc=0; for(var i=0;i<=info.index;i++) acc+=schedule[i].duration;
+    elapsedBefore=acc; lastPhaseIdx=-1; lastBeepSec=-1;
+    if(running){ startStamp=performance.now(); }
+    render(acc+0.001);
+    if(!running && !paused){ /* idle skip just previews first phase end */ render(0); }
+  });
+  ['work','rest','rounds','prep'].forEach(function(k){
+    inputs[k].addEventListener('input', function(){ if(!running) refreshSummary(); });
+  });
+  document.querySelectorAll('.preset-chip').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var p=L.getPreset(btn.getAttribute('data-preset')); if(!p) return;
+      inputs.work.value=p.work; inputs.rest.value=p.rest; inputs.rounds.value=p.rounds; inputs.prep.value=p.prep;
+      document.querySelectorAll('.preset-chip').forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+      reset();
+      statusMsg.textContent=L.PRESETS[btn.getAttribute('data-preset')].name+' loaded — press Start.';
+    });
+  });
+  document.querySelectorAll('.qadd').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var f=btn.getAttribute('data-field'), d=Number(btn.getAttribute('data-delta'));
+      var inp=inputs[f]; inp.value=(Number(inp.value)||0)+d;
+      refreshSummary();
+    });
+  });
+  $('soundBtn').addEventListener('click', function(){
+    soundOn=!soundOn;
+    this.textContent= soundOn?'🔊 Sound On':'🔇 Sound Off';
+    this.classList.toggle('active', soundOn);
+    this.setAttribute('aria-pressed', soundOn?'true':'false');
+    if(soundOn) beep(880,0.1,0);
+  });
+  $('testBeepBtn').addEventListener('click', function(){
+    if(!soundOn){ statusMsg.textContent='Sound is off — turn it on to hear beeps.'; return; }
+    beep(880,0.12,0); beep(1320,0.18,0.16);
+    statusMsg.textContent='If you heard two beeps, your sound is ready.';
+  });
+  $('bigBtn').addEventListener('click', function(){
+    var el=$('stage');
+    if(document.fullscreenElement){ document.exitFullscreen(); return; }
+    document.body.classList.add('bigmode');
+    if(el.requestFullscreen) el.requestFullscreen().catch(function(){});
+    statusMsg.textContent='Big-screen mode — press Esc to exit.';
+  });
+  document.addEventListener('fullscreenchange', function(){
+    if(!document.fullscreenElement) document.body.classList.remove('bigmode');
+    else document.body.classList.add('bigmode');
+  });
+  document.addEventListener('keydown', function(e){
+    if(e.code==='Space' && !/INPUT|BUTTON/.test(document.activeElement.tagName)){
+      e.preventDefault(); startPause();
+    }
+  });
+  refreshSummary();
+})();
+</script>
+</body>
+</html>
